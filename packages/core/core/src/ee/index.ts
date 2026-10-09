@@ -35,6 +35,32 @@ const ee: EE = {
   },
 };
 
+/**
+ * ADHAR FORK — features this distribution ships without a Strapi licence.
+ *
+ * The platform needs one thing from the Enterprise tree: admin-panel SSO, so
+ * an operator signs in to Strapi with the same Keycloak account they use for
+ * every other Adhar service instead of a second local password. The SSO
+ * implementation under `ee/` is already generic — it registers whatever
+ * passport strategies `config.admin.auth.providers` declares — so nothing had
+ * to be reimplemented; only the gate is lifted.
+ *
+ * The gate is deliberately per-feature. `strapi.EE` decides whether the `ee/`
+ * tree is LOADED, and each feature then checks its own name through
+ * `features.isEnabled(...)`. Listing only 'sso' here therefore leaves
+ * audit-logs, content-releases, review-workflows and seat enforcement exactly
+ * as locked as they are in Community Edition — seat enforcement in particular
+ * no-ops because `strapi.ee.seats` stays undefined without a licence.
+ *
+ * Nothing here fakes a licence: `ee.enabled`, `seats`, `type` and `isTrial`
+ * still come only from a verified licence, and license checking is untouched.
+ *
+ * Licence note: code under an `ee/` directory is covered by
+ * `packages/core/admin/ee/LICENSE`, not the repository's MIT licence. Enabling
+ * it is a deliberate decision recorded by the Adhar maintainers.
+ */
+const ADHAR_BUNDLED_FEATURES = ['sso'];
+
 const disable = (message: string) => {
   // Prevent emitting ee.disable if it was already disabled
   const shouldEmitEvent = ee.enabled !== false;
@@ -262,11 +288,19 @@ const getTrialEndDate = async ({
 };
 
 const list = () => {
-  return (
+  const licensed =
     ee.licenseInfo.features?.map((feature) =>
       typeof feature === 'object' ? feature : { name: feature }
-    ) || []
-  );
+    ) || [];
+
+  // A licence that already grants a bundled feature wins, so its extra
+  // configuration (options, limits) is not discarded by this fork.
+  const licensedNames = new Set(licensed.map((feature) => feature.name));
+  const bundled = ADHAR_BUNDLED_FEATURES.filter((name) => !licensedNames.has(name)).map((name) => ({
+    name,
+  }));
+
+  return [...licensed, ...bundled];
 };
 
 const get = (featureName: string) => list().find((feature) => feature.name === featureName);
@@ -277,7 +311,12 @@ export default Object.freeze({
   getTrialEndDate,
 
   get isEE() {
-    return ee.enabled;
+    // True when a licence enables EE, and also when this distribution bundles
+    // any feature from the ee/ tree — `packages/core/admin/server/src/index.ts`
+    // only merges the EE admin module when this is true, so a bundled feature
+    // would otherwise never be reachable. Per-feature gates still decide what
+    // is actually usable; see ADHAR_BUNDLED_FEATURES.
+    return ee.enabled || ADHAR_BUNDLED_FEATURES.length > 0;
   },
 
   get seats() {
