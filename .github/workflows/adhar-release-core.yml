@@ -1,0 +1,122 @@
+# Publish the Adhar fork's patched @strapi/core as a release tarball.
+#
+# Why a tarball and not a package registry: GitHub Packages requires an npm
+# package's scope to match the owner, so `@strapi/core` cannot be published
+# under `adhar-io`. Renaming it to `@adhar-io/strapi-core` would break every
+# internal `@strapi/core` import and Strapi's by-name plugin resolution, so the
+# package keeps its real name and is consumed through a dependency override
+# pointed at this release asset. See the Adhar platform's strapi package.
+#
+# What the fork changes: exactly one file,
+# `packages/core/core/src/ee/index.ts`, which adds `sso` to the features this
+# distribution ships (ADHAR_BUNDLED_FEATURES) so the Strapi admin panel accepts
+# Keycloak logins like every other Adhar service. Per-feature gating is
+# preserved, so audit-logs, review-workflows and content-releases stay locked
+# and no licence entitlement is fabricated.
+name: Adhar Release @strapi/core
+
+on:
+  push:
+    tags:
+      # adhar-core-v<upstream version>-<n>, e.g. adhar-core-v5.55.1-1.
+      # Upstream's own v* tags do not trigger this.
+      - "adhar-core-v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: false
+        type: string
+
+concurrency:
+  group: adhar-release-core-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    name: Build and pack @strapi/core
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # The monorepo's engines field allows >=20 <=26; 22 is the LTS the
+          # platform's scaffold also runs.
+          node-version: 22
+
+      - name: Enable Corepack for the pinned Yarn
+        # The repo pins yarn@4 via packageManager; Corepack honours that exactly
+        # rather than whatever Yarn the runner happens to ship.
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Guard the fork's invariants
+        # The bundle must stay one feature wide. If someone widens
+        # ADHAR_BUNDLED_FEATURES, this fails here rather than in a cluster.
+        run: yarn test:unit --testPathPattern "ee/__tests__/adhar-bundled-features"
+        working-directory: packages/core/core
+
+      - name: Build @strapi/core
+        # Build only what changed and what it needs, rather than the whole
+        # monorepo: the tarball ships `dist/` and `resources/` only.
+        run: yarn nx build @strapi/core
+
+      - name: Pack the tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          cd packages/core/core
+          file="$(npm pack --silent --pack-destination "$GITHUB_WORKSPACE")"
+          echo "file=${file}" >> "$GITHUB_OUTPUT"
+          version="$(node -p "require('./package.json').version")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum "${file}" | tee "${file}.sha256"
+          echo "Packed ${file} (@strapi/core ${version})"
+
+      - name: Verify the patch is actually in the tarball
+        # A stale or unbuilt dist would publish an image that silently has no
+        # SSO — assert the marker is present in the shipped build output.
+        run: |
+          set -euo pipefail
+          tar -xzOf "${{ steps.pack.outputs.file }}" package/dist/index.js \
+            | grep -q "ADHAR_BUNDLED_FEATURES" \
+            || { echo "::error::ADHAR_BUNDLED_FEATURES missing from dist — the tarball is not the patched build"; exit 1; }
+          echo "patch present in dist"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('adhar-core-v{0}-dev', steps.pack.outputs.version) }}
+          name: "@strapi/core ${{ steps.pack.outputs.version }} (Adhar SSO)"
+          body: |
+            Patched `@strapi/core` ${{ steps.pack.outputs.version }} for the Adhar platform.
+
+            Adds admin-panel SSO to the features this distribution ships, so Strapi
+            accepts Keycloak logins. Per-feature gating is preserved — audit-logs,
+            review-workflows and content-releases remain locked, and no licence
+            entitlement is fabricated (`seats`, `type`, `isTrial` still come only
+            from a verified licence).
+
+            Consume it with a dependency override:
+
+            ```json
+            { "overrides": { "@strapi/core": "<this asset URL>" } }
+            ```
+
+            Note: code under `ee/` is covered by `packages/core/admin/ee/LICENSE`,
+            not the repository's MIT licence.
+          files: |
+            ${{ steps.pack.outputs.file }}
+            ${{ steps.pack.outputs.file }}.sha256
+          fail_on_unmatched_files: true
