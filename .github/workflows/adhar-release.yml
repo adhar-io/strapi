@@ -1,0 +1,322 @@
+# Release the Adhar fork of Strapi: the patched @strapi/core tarball and the
+# ghcr.io/adhar-io/strapi server image built on it.
+#
+# What the fork changes: `packages/core/core/src/ee/index.ts` adds `sso` to the
+# features this distribution ships (ADHAR_BUNDLED_FEATURES), so the admin panel
+# accepts Keycloak logins like every other Adhar service. Per-feature gating is
+# preserved: audit-logs, review-workflows and content-releases stay locked and
+# no licence entitlement is fabricated. `adhar/docker/` turns that into a
+# ready-to-run server (see adhar/README.md).
+#
+# Two outputs, one version:
+#   - a GitHub release carrying strapi-core-<version>.tgz, for a golden-path
+#     project that builds its own image (npm `overrides` pointed at the asset).
+#     A tarball because GitHub Packages requires an npm scope to match the
+#     owner, so @strapi/core cannot live under adhar-io, and renaming it breaks
+#     every internal import and Strapi's by-name plugin resolution.
+#   - ghcr.io/adhar-io/strapi:<version>, multi-arch, Cosign-keyless signed,
+#     which the platform's strapi package runs.
+#
+# Deliberately a separate file from upstream's publish-*.yml, so merging
+# upstream never conflicts here.
+name: Adhar Release
+
+on:
+  push:
+    tags:
+      # adhar-v<upstream version>-<n>, e.g. adhar-v5.57.0-1. Upstream's own v*
+      # tags do not trigger this.
+      - 'adhar-v*'
+    # A release/<upstream version>-<n> branch publishes the same way. The Plane
+    # fork lost tag-triggered runs on 2026-10-14 while branch pushes kept
+    # working; this is the second path, with the version read from the name.
+    branches:
+      - 'release/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish (defaults to <core version>-<short sha>); no GitHub release is cut'
+        required: false
+        type: string
+
+concurrency:
+  group: adhar-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/adhar-io/strapi
+
+jobs:
+  pack:
+    name: Build and pack @strapi/core
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      strapi_version: ${{ steps.meta.outputs.strapi_version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      release: ${{ steps.meta.outputs.release }}
+      file: ${{ steps.pack.outputs.file }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable Corepack for the pinned Yarn
+        run: corepack enable
+
+      - name: Resolve the version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          strapi_version="$(node -p "require('./packages/core/core/package.json').version")"
+          release=false
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#adhar-v}"; release=true
+          elif [ "${GITHUB_REF_NAME#release/}" != "${GITHUB_REF_NAME}" ]; then
+            tag="${GITHUB_REF_NAME#release/}"; release=true
+          elif [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="${strapi_version}-${GITHUB_SHA::7}"
+          fi
+          # Strapi's packages move in lockstep and the image scaffolds the
+          # project at this version, so a release must be cut from the matching
+          # upstream tag: adhar-v5.57.0-1 is built from v5.57.0.
+          if [ "${release}" = "true" ] && [ "${tag%-*}" != "${strapi_version}" ]; then
+            echo "::error::${GITHUB_REF_NAME} names ${tag%-*}, but this tree is @strapi/core ${strapi_version}. Branch from upstream v${tag%-*}."
+            exit 1
+          fi
+          {
+            echo "strapi_version=${strapi_version}"
+            echo "tag=${tag}"
+            echo "release=${release}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing ${tag} (Strapi ${strapi_version}, release=${release})"
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Guard the fork's invariants
+        # The bundle must stay one feature wide. If someone widens
+        # ADHAR_BUNDLED_FEATURES, this fails here rather than in a cluster.
+        run: yarn test:unit --testPathPattern "ee/__tests__/adhar-bundled-features"
+        working-directory: packages/core/core
+
+      - name: Build @strapi/core
+        run: yarn nx build @strapi/core
+
+      - name: Pack the tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          cd packages/core/core
+          file="$(npm pack --silent --pack-destination "$GITHUB_WORKSPACE")"
+          cd "$GITHUB_WORKSPACE"
+          sha256sum "${file}" | tee "${file}.sha256"
+          echo "file=${file}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the patch is in the tarball
+        # The build is per-file, so the EE gate is dist/ee/index.js, not the
+        # entry point. A stale or unbuilt dist would ship an image with no SSO.
+        run: |
+          set -euo pipefail
+          tar -xzOf "${{ steps.pack.outputs.file }}" package/dist/ee/index.js \
+            | grep -q "ADHAR_BUNDLED_FEATURES" \
+            || { echo "::error::ADHAR_BUNDLED_FEATURES missing from dist/ee — the tarball is not the patched build"; exit 1; }
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: strapi-core
+          path: |
+            ${{ steps.pack.outputs.file }}
+            ${{ steps.pack.outputs.file }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: pack
+    # Native runners, no QEMU: the admin build under emulation is what pushed
+    # the Plane fork's images past the six-hour job limit.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: strapi-core
+          path: /tmp/strapi-core
+
+      - name: Stage it into the build context
+        run: cp "/tmp/strapi-core/${{ needs.pack.outputs.file }}" adhar/docker/strapi-core.tgz
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: adhar/docker
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            STRAPI_VERSION=${{ needs.pack.outputs.strapi_version }}
+          # Untagged here; the merge job tags the multi-arch manifest.
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.pack.outputs.tag }}
+          cache-from: type=gha,scope=strapi-${{ matrix.arch }}
+          cache-to: type=gha,scope=strapi-${{ matrix.arch }},mode=max
+
+      - name: Smoke-test the image
+        # The image must at least resolve its own CLI and carry the fork's core
+        # — the two things the community images it replaces got wrong.
+        run: |
+          set -euo pipefail
+          ref="${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          docker run --rm --entrypoint node "${ref}" node_modules/.bin/strapi version
+          docker run --rm --entrypoint bash "${ref}" -c \
+            'grep -q ADHAR_BUNDLED_FEATURES node_modules/@strapi/core/dist/ee/index.js && test -d dist/build && echo ok'
+
+      - name: Record the digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Multi-arch manifest
+    needs: [pack, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      # Cosign keyless: the workflow's OIDC identity is the signing identity.
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the manifest
+        id: push
+        env:
+          TAG: ${{ needs.pack.outputs.tag }}
+          RELEASE: ${{ needs.pack.outputs.release }}
+        run: |
+          set -euo pipefail
+          cd /tmp/digests
+          refs=()
+          for f in *; do refs+=("${IMAGE}@sha256:${f}"); done
+          # Both architectures, or the platform pulls a manifest that silently
+          # lacks one of them.
+          [ "${#refs[@]}" -eq 2 ] || { echo "expected 2 digests, found ${#refs[@]}: ${refs[*]}"; exit 1; }
+          tags=(-t "${IMAGE}:${TAG}")
+          [ "${RELEASE}" = "true" ] && tags+=(-t "${IMAGE}:latest")
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign (keyless)
+        run: cosign sign --yes "${IMAGE}@${{ steps.push.outputs.digest }}"
+
+  release:
+    name: GitHub release
+    needs: [pack, manifest]
+    if: needs.pack.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: strapi-core
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          # A release/* branch push creates the tag the release needs.
+          tag_name: adhar-v${{ needs.pack.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: 'Strapi ${{ needs.pack.outputs.tag }} (Adhar)'
+          body: |
+            Strapi ${{ needs.pack.outputs.strapi_version }} for the Adhar platform, with admin-panel SSO.
+
+            **Image:** `${{ env.IMAGE }}:${{ needs.pack.outputs.tag }}`
+            (`${{ env.IMAGE }}@${{ needs.manifest.outputs.digest }}`), linux/amd64 + linux/arm64, Cosign-keyless signed.
+
+            **Tarball:** patched `@strapi/core` ${{ needs.pack.outputs.strapi_version }}, for a project that builds its own image:
+
+            ```json
+            { "overrides": { "@strapi/core": "https://github.com/${{ github.repository }}/releases/download/adhar-v${{ needs.pack.outputs.tag }}/${{ needs.pack.outputs.file }}" } }
+            ```
+
+            Adds admin SSO to the features this distribution ships. Audit logs, review workflows and
+            content releases stay locked, and no licence entitlement is fabricated.
+            Code under `ee/` is covered by `packages/core/admin/ee/LICENSE`, not the repository's MIT licence.
+          files: |
+            ${{ needs.pack.outputs.file }}
+            ${{ needs.pack.outputs.file }}.sha256
+          fail_on_unmatched_files: true
