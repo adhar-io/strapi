@@ -1,0 +1,3 @@
+strapi-core.tgz
+# The root .gitignore ignores build/; this one is source.
+!build/
