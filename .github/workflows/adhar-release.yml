@@ -105,14 +105,16 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
+      - name: Build @strapi/core
+        run: yarn nx build @strapi/core
+
       - name: Guard the fork's invariants
         # The bundle must stay one feature wide. If someone widens
         # ADHAR_BUNDLED_FEATURES, this fails here rather than in a cluster.
+        # After the build: src/ee imports @strapi/utils, which resolves to its
+        # dist/, and a fresh checkout has none until nx builds the deps.
         run: yarn test:unit --testPathPattern "ee/__tests__/adhar-bundled-features"
         working-directory: packages/core/core
-
-      - name: Build @strapi/core
-        run: yarn nx build @strapi/core
 
       - name: Pack the tarball
         id: pack
@@ -210,7 +212,7 @@ jobs:
           ref="${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
           docker run --rm --entrypoint node "${ref}" node_modules/.bin/strapi version
           docker run --rm --entrypoint bash "${ref}" -c \
-            'grep -q ADHAR_BUNDLED_FEATURES node_modules/@strapi/core/dist/ee/index.js && test -d dist/build && echo ok'
+            'grep -q ADHAR_BUNDLED_FEATURES node_modules/@strapi/core/dist/ee/index.js && test -f build/index.html && echo ok'
 
       - name: Record the digest
         run: |
